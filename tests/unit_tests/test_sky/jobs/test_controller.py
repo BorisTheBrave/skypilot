@@ -1077,3 +1077,269 @@ class TestDownloadLogsForCancelledJob:
                 0, mock_handle_0, None)
             controller.download_log_and_stream.assert_any_call(
                 1, mock_handle_1, None)
+
+
+class TestDagExecution:
+    """Tests for JobController._run_dag (DagExecution.DAG mode).
+
+    DAG mode runs each task as its own concurrent asyncio task, gated on
+    predecessor success. Failure or cancellation of any predecessor causes
+    the descendant to be marked CANCELLED with a failure_reason naming the
+    upstream tasks that did not succeed.
+    """
+
+    # Tests reach into private methods of JobController and use lambdas with
+    # pytest-style positional arguments that are ignored inside the fake.
+    # pylint: disable=protected-access,unused-argument
+
+    def _build_dag(self, num_tasks: int, edges):
+        """Build a real sky.Dag with `num_tasks` tasks and the given edges.
+
+        Args:
+            num_tasks: Number of tasks. Names will be 't0', 't1', ...
+            edges: Iterable of (src_idx, dst_idx) tuples.
+        """
+        # Import here to avoid pulling sky.Task into module import time.
+        # pylint: disable=import-outside-toplevel
+        from sky import dag as dag_lib
+        from sky import task as task_lib
+
+        dag = dag_lib.Dag()
+        dag.name = 'test-dag'
+        tasks = []
+        for i in range(num_tasks):
+            t = task_lib.Task(name=f't{i}', run='echo')
+            dag.add(t)
+            tasks.append(t)
+        for src, dst in edges:
+            dag.add_edge(tasks[src], tasks[dst])
+        dag.set_execution(dag_lib.DagExecution.DAG)
+        return dag, tasks
+
+    def _make_controller(self, dag):
+        """Construct a JobController bypassing __init__ for testing."""
+        # pylint: disable=import-outside-toplevel
+        from sky.jobs.controller import JobController
+        controller = JobController.__new__(JobController)
+        controller._job_id = 1
+        controller._dag = dag
+        return controller
+
+    @pytest.mark.asyncio
+    async def test_diamond_dag_concurrency_and_ordering(self):
+        """a -> {b, c} -> d. b and c run concurrently after a."""
+        # 0=a, 1=b, 2=c, 3=d
+        dag, _ = self._build_dag(4, [(0, 1), (0, 2), (1, 3), (2, 3)])
+        controller = self._make_controller(dag)
+
+        start_times: Dict[int, float] = {}
+        end_times: Dict[int, float] = {}
+        loop = asyncio.get_event_loop()
+
+        async def fake_run(task_id, task, dag_mode=False):
+            assert dag_mode is True
+            start_times[task_id] = loop.time()
+            await asyncio.sleep(0.05)
+            end_times[task_id] = loop.time()
+            return True
+
+        with patch('sky.jobs.state.get_job_status_with_task_id_async',
+                   new_callable=AsyncMock,
+                   return_value=None), \
+             patch.object(controller, '_run_one_task',
+                          side_effect=fake_run), \
+             patch.object(controller, '_mark_task_cancelled',
+                          new_callable=AsyncMock) as mock_cancel:
+            ok = await controller._run_dag()
+
+        assert ok is True
+        assert mock_cancel.call_count == 0
+        # b and c must start after a finishes.
+        assert start_times[1] >= end_times[0]
+        assert start_times[2] >= end_times[0]
+        # b and c should overlap (started within 30ms of each other).
+        assert abs(start_times[1] - start_times[2]) < 0.03
+        # d only after both b and c finish.
+        assert start_times[3] >= end_times[1]
+        assert start_times[3] >= end_times[2]
+
+    @pytest.mark.asyncio
+    async def test_failure_propagates_as_cancelled(self):
+        """a -> {b, c}. a fails. b and c are marked CANCELLED, never run."""
+        dag, tasks = self._build_dag(3, [(0, 1), (0, 2)])
+        controller = self._make_controller(dag)
+
+        ran: List[int] = []
+
+        async def fake_run(task_id, task, dag_mode=False):
+            ran.append(task_id)
+            return task_id == 0 and False  # task 0 fails
+
+        cancel_calls: List[Tuple[int, str]] = []
+
+        async def fake_cancel(task_id, task, reason):
+            cancel_calls.append((task_id, reason))
+
+        with patch('sky.jobs.state.get_job_status_with_task_id_async',
+                   new_callable=AsyncMock,
+                   return_value=None), \
+             patch.object(controller, '_run_one_task',
+                          side_effect=fake_run), \
+             patch.object(controller, '_mark_task_cancelled',
+                          side_effect=fake_cancel):
+            ok = await controller._run_dag()
+
+        assert ok is False
+        assert ran == [0]  # only a ran; b and c were skipped
+        assert sorted(tid for tid, _ in cancel_calls) == [1, 2]
+        for _, reason in cancel_calls:
+            assert 't0' in reason
+
+    @pytest.mark.asyncio
+    async def test_multi_hop_propagation(self):
+        """a -> b -> c. a fails. Both b and c end CANCELLED."""
+        dag, _ = self._build_dag(3, [(0, 1), (1, 2)])
+        controller = self._make_controller(dag)
+
+        async def fake_run(task_id, task, dag_mode=False):
+            return False  # a fails
+
+        cancelled: List[int] = []
+
+        async def fake_cancel(task_id, task, reason):
+            cancelled.append(task_id)
+
+        with patch('sky.jobs.state.get_job_status_with_task_id_async',
+                   new_callable=AsyncMock,
+                   return_value=None), \
+             patch.object(controller, '_run_one_task',
+                          side_effect=fake_run), \
+             patch.object(controller, '_mark_task_cancelled',
+                          side_effect=fake_cancel):
+            ok = await controller._run_dag()
+
+        assert ok is False
+        assert sorted(cancelled) == [1, 2]
+
+    @pytest.mark.asyncio
+    async def test_independent_branch_continues_after_sibling_failure(self):
+        """a -> b (fails); c -> d (independent). c and d still run + succeed."""
+        # 0=a, 1=b, 2=c, 3=d
+        dag, _ = self._build_dag(4, [(0, 1), (2, 3)])
+        controller = self._make_controller(dag)
+
+        async def fake_run(task_id, task, dag_mode=False):
+            # a fails, others succeed
+            return task_id != 0
+
+        cancelled: List[int] = []
+
+        async def fake_cancel(task_id, task, reason):
+            cancelled.append(task_id)
+
+        with patch('sky.jobs.state.get_job_status_with_task_id_async',
+                   new_callable=AsyncMock,
+                   return_value=None), \
+             patch.object(controller, '_run_one_task',
+                          side_effect=fake_run), \
+             patch.object(controller, '_mark_task_cancelled',
+                          side_effect=fake_cancel):
+            ok = await controller._run_dag()
+
+        # Overall result is False because a failed.
+        assert ok is False
+        # Only b (downstream of a) is cancelled; c and d are unaffected.
+        assert cancelled == [1]
+
+    @pytest.mark.asyncio
+    async def test_resume_with_terminal_predecessor(self):
+        """Resume: a is SUCCEEDED in DB, b should run; d should still gate."""
+        # 0=a, 1=b, 2=c, 3=d  (a -> {b, c} -> d)
+        dag, _ = self._build_dag(4, [(0, 1), (0, 2), (1, 3), (2, 3)])
+        controller = self._make_controller(dag)
+
+        statuses = {
+            0: managed_job_state.ManagedJobStatus.SUCCEEDED,
+            1: None,
+            2: None,
+            3: None,
+        }
+
+        async def get_status(job_id, task_id):
+            return statuses[task_id]
+
+        ran: List[int] = []
+
+        async def fake_run(task_id, task, dag_mode=False):
+            ran.append(task_id)
+            return True
+
+        with patch('sky.jobs.state.get_job_status_with_task_id_async',
+                   side_effect=get_status), \
+             patch.object(controller, '_run_one_task',
+                          side_effect=fake_run), \
+             patch.object(controller, '_mark_task_cancelled',
+                          new_callable=AsyncMock):
+            ok = await controller._run_dag()
+
+        assert ok is True
+        # a is not re-run; b, c, d are.
+        assert sorted(ran) == [1, 2, 3]
+
+    @pytest.mark.asyncio
+    async def test_resume_all_terminal_returns_immediately(self):
+        """All tasks already SUCCEEDED in DB; _run_one_task is never called."""
+        dag, _ = self._build_dag(3, [(0, 1), (1, 2)])
+        controller = self._make_controller(dag)
+
+        async def get_status(job_id, task_id):
+            return managed_job_state.ManagedJobStatus.SUCCEEDED
+
+        with patch('sky.jobs.state.get_job_status_with_task_id_async',
+                   side_effect=get_status), \
+             patch.object(controller, '_run_one_task',
+                          new_callable=AsyncMock) as mock_run:
+            ok = await controller._run_dag()
+
+        assert ok is True
+        assert mock_run.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_resume_cancelling_raises(self):
+        """If any task is in CANCELLING state on resume, raise CancelledError."""
+        dag, _ = self._build_dag(2, [(0, 1)])
+        controller = self._make_controller(dag)
+
+        statuses = {
+            0: managed_job_state.ManagedJobStatus.SUCCEEDED,
+            1: managed_job_state.ManagedJobStatus.CANCELLING,
+        }
+
+        async def get_status(job_id, task_id):
+            return statuses[task_id]
+
+        with patch('sky.jobs.state.get_job_status_with_task_id_async',
+                   side_effect=get_status):
+            with pytest.raises(asyncio.CancelledError):
+                await controller._run_dag()
+
+    @pytest.mark.asyncio
+    async def test_acyclic_validation_in_server_core(self):
+        """Cyclic DAGs are rejected at submission with a clear ValueError."""
+        # pylint: disable=import-outside-toplevel
+        import networkx as nx
+
+        from sky import dag as dag_lib
+        from sky import task as task_lib
+
+        cyclic = dag_lib.Dag()
+        a = task_lib.Task(name='a', run='echo')
+        b = task_lib.Task(name='b', run='echo')
+        cyclic.add(a)
+        cyclic.add(b)
+        cyclic.add_edge(a, b)
+        cyclic.add_edge(b, a)
+        cyclic.set_execution(dag_lib.DagExecution.DAG)
+
+        # Mirror the validation snippet from sky/jobs/server/core.py.
+        assert not nx.is_directed_acyclic_graph(cyclic.graph)

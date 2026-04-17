@@ -16,6 +16,7 @@ class DagExecution(enum.Enum):
     """
     SERIAL = 'serial'  # Tasks execute sequentially (pipeline)
     PARALLEL = 'parallel'  # All tasks start in parallel (job group)
+    DAG = 'dag'  # Tasks run concurrently, gated on predecessor success
 
 
 # Default execution mode for jobs without an explicit execution mode set.
@@ -95,6 +96,14 @@ class Dag:
         defining characteristic that distinguishes job groups from pipelines.
         """
         return self.execution == DagExecution.PARALLEL
+
+    def is_dag_execution(self) -> bool:
+        """Check if this DAG runs with dependency-gated concurrent execution.
+
+        In DAG mode, each task runs as its own concurrent worker but only
+        starts once all of its predecessors (per ``add_edge``) have succeeded.
+        """
+        return self.execution == DagExecution.DAG
 
     def set_execution(self, execution: 'DagExecution') -> None:
         """Configure this DAG with the given execution mode."""

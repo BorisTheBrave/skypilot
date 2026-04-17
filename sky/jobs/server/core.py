@@ -550,14 +550,25 @@ def launch(
     dag, mutated_user_config = admin_policy_utils.apply(
         dag, request_name=request_names.AdminPolicyRequestName.JOBS_LAUNCH)
     dag.resolve_and_validate_volumes()
-    if not dag.is_chain() and not dag.is_job_group():
+    if (not dag.is_chain() and not dag.is_job_group() and
+            not dag.is_dag_execution()):
         with ux_utils.print_exception_no_traceback():
-            raise ValueError('Only single-task, chain DAG, or JobGroup is '
-                             f'allowed for job_launch. Dag: {dag}')
-    if dag.is_job_group() and pool is not None:
+            raise ValueError(
+                'Only single-task, chain DAG, JobGroup, or DAG-execution '
+                f'is allowed for job_launch. Dag: {dag}')
+    if dag.is_dag_execution():
+        # pylint: disable=import-outside-toplevel
+        import networkx as nx
+        if not nx.is_directed_acyclic_graph(dag.graph):
+            with ux_utils.print_exception_no_traceback():
+                raise ValueError(
+                    'DAG-execution requires an acyclic dependency graph; '
+                    f'a cycle was detected. Dag: {dag}')
+    if (dag.is_job_group() or dag.is_dag_execution()) and pool is not None:
         with ux_utils.print_exception_no_traceback():
-            raise ValueError('JobGroups do not support pools. Please remove '
-                             'the --pool argument when launching a job group.')
+            mode = 'JobGroups' if dag.is_job_group() else 'DAG-execution jobs'
+            raise ValueError(f'{mode} do not support pools. Please remove '
+                             'the --pool argument.')
     dag.validate()
     # TODO(aylei): use consolidated job controller instead of performing
     # pre-mount operations when submitting jobs.
@@ -565,6 +576,8 @@ def launch(
 
     # Optimize JobGroup before sending to controller
     # This pre-determines cloud+region for all tasks, enabling parallel launch
+    # on a shared infrastructure. DAG-execution skips this step because its
+    # tasks each get their own cluster and do not share infra.
     if dag.is_job_group():
         dag = optimizer_lib.Optimizer.optimize_job_group(dag)
         # Apply optimized cloud/region to task resources so they persist
@@ -585,18 +598,20 @@ def launch(
                         override_params['region'] = best_region
                     task_.set_resources_override(override_params)
 
-        # Warn if job group is not running on Kubernetes (networking won't work)
-        first_task = dag.tasks[0]
-        if first_task.best_resources is not None:
-            best_cloud = first_task.best_resources.cloud
-            if best_cloud is not None and str(
-                    best_cloud).lower() != 'kubernetes':
-                logger.warning(
-                    f'{colorama.Fore.YELLOW}Job group service discovery '
-                    f'(hostname-based networking) is only supported on '
-                    f'Kubernetes. Tasks will run on {best_cloud} but cannot '
-                    f'communicate with each other using hostnames.'
-                    f'{colorama.Style.RESET_ALL}')
+        # Warn if job group is not running on Kubernetes (networking won't
+        # work). DAG-execution does not use job-group networking, so skip.
+        if dag.is_job_group():
+            first_task = dag.tasks[0]
+            if first_task.best_resources is not None:
+                best_cloud = first_task.best_resources.cloud
+                if best_cloud is not None and str(
+                        best_cloud).lower() != 'kubernetes':
+                    logger.warning(
+                        f'{colorama.Fore.YELLOW}Job group service discovery '
+                        f'(hostname-based networking) is only supported on '
+                        f'Kubernetes. Tasks will run on {best_cloud} but '
+                        f'cannot communicate with each other using '
+                        f'hostnames.{colorama.Style.RESET_ALL}')
 
     # If there is a local postgres db, when the api server tries launching on
     # the remote jobs controller it will fail. therefore, we should remove this

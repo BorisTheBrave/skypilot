@@ -2606,6 +2606,37 @@ async def set_cancelled_async(job_id: int, callback_func: AsyncCallbackType):
         logger.info('Cancellation skipped, job is not CANCELLING')
 
 
+async def set_task_cancelled_async(job_id: int, task_id: int,
+                                   failure_reason: str,
+                                   callback_func: AsyncCallbackType) -> None:
+    """Cancel a single task of a job, recording a failure reason.
+
+    Used by DAG-mode execution to skip a task whose predecessor failed.
+    Only updates the row if the task is currently non-terminal.
+    """
+    await add_job_event_async(job_id, task_id, ManagedJobStatus.CANCELLED,
+                              f'Task cancelled: {failure_reason}')
+    engine = await _db_manager.get_async_engine()
+    async with sql_async.AsyncSession(engine) as session:
+        result = await session.execute(
+            sqlalchemy.update(spot_table).where(
+                sqlalchemy.and_(
+                    spot_table.c.spot_job_id == job_id,
+                    spot_table.c.task_id == task_id,
+                    spot_table.c.end_at.is_(None),
+                )).values({
+                    spot_table.c.status: ManagedJobStatus.CANCELLED.value,
+                    spot_table.c.failure_reason: failure_reason,
+                    spot_table.c.end_at: time.time(),
+                }))
+        count = result.rowcount
+        await session.commit()
+    if count > 0:
+        logger.info(f'Task {task_id} of job {job_id} cancelled: '
+                    f'{failure_reason}')
+        await callback_func('CANCELLED')
+
+
 async def remove_ha_recovery_script_async(job_id: int) -> None:
     """Remove the HA recovery script for a job."""
     engine = await _db_manager.get_async_engine()

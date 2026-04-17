@@ -2,7 +2,7 @@
 import copy
 import os
 import re
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from sky import dag as dag_lib
 from sky import sky_logging
@@ -21,6 +21,11 @@ _JOB_GROUP_HEADER_FIELDS = {
     'name', 'execution', 'primary_tasks', 'termination_delay'
 }
 _JOB_GROUP_REQUIRED_HEADER_FIELDS = {'name'}
+
+# DAG-execution header fields. ``dependencies`` is a mapping from task name
+# to a list of predecessor task names.
+_DAG_EXECUTION_HEADER_FIELDS = {'name', 'execution', 'dependencies'}
+_DAG_EXECUTION_REQUIRED_HEADER_FIELDS = {'name'}
 
 # Message thrown when APIs sky.{exec,launch,jobs.launch}() received a string
 # instead of a Dag.  CLI (cli.py) is implemented by us so should not trigger
@@ -247,8 +252,9 @@ def dump_dag_to_yaml_str(dag: dag_lib.Dag,
     """
     if dag.is_job_group():
         return dump_job_group_to_yaml_str(dag, use_user_specified_yaml)
-    else:
-        return dump_chain_dag_to_yaml_str(dag, use_user_specified_yaml)
+    if dag.is_dag_execution():
+        return dump_dag_execution_to_yaml_str(dag, use_user_specified_yaml)
+    return dump_chain_dag_to_yaml_str(dag, use_user_specified_yaml)
 
 
 def dump_dag_to_yaml(dag: dag_lib.Dag,
@@ -287,9 +293,11 @@ def load_dag_from_yaml_str(
     if is_job_group_yaml_str(yaml_str):
         return load_job_group_from_yaml_str(yaml_str, env_overrides,
                                             secrets_overrides)
-    else:
-        return load_chain_dag_from_yaml_str(yaml_str, env_overrides,
-                                            secrets_overrides)
+    if is_dag_execution_yaml_str(yaml_str):
+        return load_dag_execution_from_yaml_str(yaml_str, env_overrides,
+                                                secrets_overrides)
+    return load_chain_dag_from_yaml_str(yaml_str, env_overrides,
+                                        secrets_overrides)
 
 
 def load_dag_from_yaml(
@@ -312,8 +320,10 @@ def load_dag_from_yaml(
     """
     if is_job_group_yaml(path):
         return load_job_group_from_yaml(path, env_overrides, secrets_overrides)
-    else:
-        return load_chain_dag_from_yaml(path, env_overrides, secrets_overrides)
+    if is_dag_execution_yaml(path):
+        return load_dag_execution_from_yaml(path, env_overrides,
+                                            secrets_overrides)
+    return load_chain_dag_from_yaml(path, env_overrides, secrets_overrides)
 
 
 def maybe_infer_and_fill_dag_and_task_names(dag: dag_lib.Dag) -> None:
@@ -686,3 +696,170 @@ def dump_job_group_to_yaml_str(dag: dag_lib.Dag,
         configs.append(job_config)
 
     return yaml_utils.dump_yaml_str(configs)
+
+
+# ---- DAG-execution mode (concurrent, dependency-gated) --------------------
+
+
+def is_dag_execution_yaml(path: str) -> bool:
+    """Check if a YAML file defines a DAG-execution job."""
+    configs = yaml_utils.read_yaml_all(path)
+    return _is_dag_execution_configs(configs)
+
+
+def is_dag_execution_yaml_str(yaml_str: str) -> bool:
+    """Check if a YAML string defines a DAG-execution job."""
+    configs = yaml_utils.read_yaml_all_str(yaml_str)
+    return _is_dag_execution_configs(configs)
+
+
+def _is_dag_execution_configs(configs: List[Dict[str, Any]]) -> bool:
+    if not configs or len(configs) < 2:
+        return False
+    header = configs[0]
+    if header is None:
+        return False
+    return header.get('execution') == dag_lib.DagExecution.DAG.value
+
+
+def dump_dag_execution_to_yaml_str(
+        dag: dag_lib.Dag, use_user_specified_yaml: bool = False) -> str:
+    """Dump a DAG-execution DAG to a multi-document YAML string.
+
+    Format: header doc (``name``, ``execution: dag``, ``dependencies``) followed
+    by one doc per task. ``dependencies`` is a mapping ``{task_name:
+    [predecessor_name, ...]}`` and is only emitted for tasks that have at
+    least one predecessor.
+    """
+    assert dag.is_dag_execution(), 'DAG is not in DagExecution.DAG mode'
+
+    dependencies: Dict[str, List[str]] = {}
+    for task in dag.tasks:
+        preds = [
+            p.name for p in dag.graph.predecessors(task) if p.name is not None
+        ]
+        if preds:
+            assert task.name is not None, task
+            dependencies[task.name] = preds
+
+    header: Dict[str, Any] = {
+        'name': dag.name,
+        'execution': dag_lib.DagExecution.DAG.value,
+    }
+    if dependencies:
+        header['dependencies'] = dependencies
+
+    configs: List[Dict[str, Any]] = [header]
+    for task in dag.tasks:
+        configs.append(
+            task.to_yaml_config(
+                use_user_specified_yaml=use_user_specified_yaml))
+    return yaml_utils.dump_yaml_str(configs)
+
+
+def load_dag_execution_from_yaml(
+    path: str,
+    env_overrides: Optional[List[Tuple[str, str]]] = None,
+    secrets_overrides: Optional[List[Tuple[str, str]]] = None,
+) -> dag_lib.Dag:
+    """Load a DAG-execution job from a multi-document YAML file."""
+    configs = yaml_utils.read_yaml_all(path)
+    return _load_dag_execution(configs, env_overrides, secrets_overrides)
+
+
+def load_dag_execution_from_yaml_str(
+    yaml_str: str,
+    env_overrides: Optional[List[Tuple[str, str]]] = None,
+    secrets_overrides: Optional[List[Tuple[str, str]]] = None,
+) -> dag_lib.Dag:
+    """Load a DAG-execution job from a multi-document YAML string."""
+    configs = yaml_utils.read_yaml_all_str(yaml_str)
+    return _load_dag_execution(configs, env_overrides, secrets_overrides)
+
+
+def _load_dag_execution(
+    configs: List[Dict[str, Any]],
+    env_overrides: Optional[List[Tuple[str, str]]] = None,
+    secrets_overrides: Optional[List[Tuple[str, str]]] = None,
+) -> dag_lib.Dag:
+    if not configs or len(configs) < 2:
+        with ux_utils.print_exception_no_traceback():
+            raise ValueError('DAG-execution YAML must have at least 2 '
+                             'documents: header and at least one task.')
+
+    header = configs[0]
+    if header is None:
+        with ux_utils.print_exception_no_traceback():
+            raise ValueError('DAG-execution header cannot be empty.')
+
+    missing = _DAG_EXECUTION_REQUIRED_HEADER_FIELDS - set(header.keys())
+    if missing:
+        with ux_utils.print_exception_no_traceback():
+            raise ValueError(
+                f'DAG-execution header missing required fields: {missing}')
+
+    unknown = set(header.keys()) - _DAG_EXECUTION_HEADER_FIELDS
+    if unknown:
+        logger.warning(f'Unknown fields in DAG-execution header: {unknown}. '
+                       'These will be ignored.')
+
+    dag_name = header['name']
+    if not dag_name or not all(c.isalnum() or c in '-_' for c in dag_name):
+        with ux_utils.print_exception_no_traceback():
+            raise ValueError(f'Invalid DAG name: {dag_name!r}. Name must '
+                             'contain only alphanumeric characters, hyphens, '
+                             'and underscores.')
+
+    task_configs = configs[1:]
+    task_names: Set[str] = set()
+    with dag_lib.Dag() as dag:
+        for i, tc in enumerate(task_configs):
+            if tc is None:
+                continue
+            task_name = tc.get('name')
+            if task_name is None:
+                with ux_utils.print_exception_no_traceback():
+                    raise ValueError(
+                        f'Task {i + 1} in DAG-execution must have a "name".')
+            if not all(c.isalnum() or c in '-_' for c in task_name):
+                with ux_utils.print_exception_no_traceback():
+                    raise ValueError(
+                        f'Invalid task name: {task_name!r}. Name must '
+                        'contain only alphanumeric characters, hyphens, '
+                        'and underscores.')
+            if task_name in task_names:
+                with ux_utils.print_exception_no_traceback():
+                    raise ValueError(
+                        f'Duplicate task name in DAG-execution: {task_name}')
+            task_names.add(task_name)
+            task = task_lib.Task.from_yaml_config(tc, env_overrides,
+                                                  secrets_overrides)
+            task.name = task_name
+
+    dag.name = dag_name
+    dag.set_execution(dag_lib.DagExecution.DAG)
+
+    # Rebuild edges from header.dependencies.
+    name_to_task = {t.name: t for t in dag.tasks}
+    dependencies = header.get('dependencies') or {}
+    if not isinstance(dependencies, dict):
+        with ux_utils.print_exception_no_traceback():
+            raise ValueError(f'dependencies must be a mapping, got '
+                             f'{type(dependencies).__name__}')
+    for child, preds in dependencies.items():
+        if child not in name_to_task:
+            with ux_utils.print_exception_no_traceback():
+                raise ValueError(
+                    f'dependencies references unknown task: {child!r}')
+        if not isinstance(preds, list):
+            with ux_utils.print_exception_no_traceback():
+                raise ValueError(f'dependencies[{child!r}] must be a list, got '
+                                 f'{type(preds).__name__}')
+        for pred in preds:
+            if pred not in name_to_task:
+                with ux_utils.print_exception_no_traceback():
+                    raise ValueError(
+                        f'dependencies[{child!r}] references unknown '
+                        f'task: {pred!r}')
+            dag.add_edge(name_to_task[pred], name_to_task[child])
+    return dag

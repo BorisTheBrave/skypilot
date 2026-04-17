@@ -341,7 +341,10 @@ class JobController:
             logger.debug(f'Failed to retrieve job exit codes: {e}')
             return None
 
-    async def _run_one_task(self, task_id: int, task: 'sky.Task') -> bool:
+    async def _run_one_task(self,
+                            task_id: int,
+                            task: 'sky.Task',
+                            dag_mode: bool = False) -> bool:
         """Busy loop monitoring cluster status and handling recovery.
 
         When the task is successfully completed, this function returns True,
@@ -352,6 +355,13 @@ class JobController:
         In other cases, the function will raise exceptions.
         All the failure cases will rely on the caller to clean up the spot
         cluster(s) and storages.
+
+        Args:
+            dag_mode: If True, use per-task resume detection (each task
+                tracked independently) instead of the serial-progression
+                check, which assumes monotonic task_id ordering. Required
+                when this method is invoked concurrently for sibling tasks
+                of a ``DagExecution.DAG`` job.
 
         Returns:
             True if the job is successfully completed; False otherwise.
@@ -380,22 +390,41 @@ class JobController:
         logger.info(
             f'Starting task {task_id} ({task.name}) for job {self._job_id}')
 
-        latest_task_id, last_task_prev_status = (
-            await
-            managed_job_state.get_latest_task_id_status_async(self._job_id))
-
         is_resume = False
-        if (latest_task_id is not None and last_task_prev_status !=
-                managed_job_state.ManagedJobStatus.PENDING):
-            assert latest_task_id >= task_id, (latest_task_id, task_id)
-            if latest_task_id > task_id:
-                logger.info(f'Task {task_id} ({task.name}) has already '
-                            'been executed. Skipping...')
-                return True
-            if latest_task_id == task_id:
-                # Start recovery.
+        if dag_mode:
+            # DAG mode: each task is gated independently, so resume detection
+            # uses this task's own status, not the latest task in the job.
+            this_task_status = await (
+                managed_job_state.get_job_status_with_task_id_async(
+                    job_id=self._job_id, task_id=task_id))
+            if (this_task_status is not None and this_task_status !=
+                    managed_job_state.ManagedJobStatus.PENDING):
+                if this_task_status.is_terminal():
+                    logger.info(
+                        f'Task {task_id} ({task.name}) already terminal: '
+                        f'{this_task_status}')
+                    return (this_task_status ==
+                            managed_job_state.ManagedJobStatus.SUCCEEDED)
                 is_resume = True
-                logger.info(f'Resuming task {task_id} from previous execution')
+                logger.info(f'Resuming DAG task {task_id} from prev status '
+                            f'{this_task_status}')
+        else:
+            latest_task_id, last_task_prev_status = (
+                await
+                managed_job_state.get_latest_task_id_status_async(self._job_id))
+
+            if (latest_task_id is not None and last_task_prev_status !=
+                    managed_job_state.ManagedJobStatus.PENDING):
+                assert latest_task_id >= task_id, (latest_task_id, task_id)
+                if latest_task_id > task_id:
+                    logger.info(f'Task {task_id} ({task.name}) has already '
+                                'been executed. Skipping...')
+                    return True
+                if latest_task_id == task_id:
+                    # Start recovery.
+                    is_resume = True
+                    logger.info(
+                        f'Resuming task {task_id} from previous execution')
 
         callback_func = managed_job_utils.event_callback_func(
             job_id=self._job_id, task_id=task_id, task=task)
@@ -427,9 +456,13 @@ class JobController:
         # or `recover` function from the strategy executor.
         cluster_name = managed_job_utils.generate_managed_job_cluster_name(
             task.name, self._job_id) if self._pool is None else None
-        self._strategy_executor = recovery_strategy.StrategyExecutor.make(
+        # Use a local for the executor — in DAG mode, multiple tasks of the
+        # same job run concurrently, so storing on `self` would race.
+        executor = recovery_strategy.StrategyExecutor.make(
             cluster_name, self._backend, task, self._job_id, task_id,
             self._pool, self.starting, self.starting_lock, self.starting_signal)
+        if not dag_mode:
+            self._strategy_executor = executor
         if not is_resume:
             submitted_at = time.time()
             if task_id == 0:
@@ -452,10 +485,8 @@ class JobController:
                 submitted_at,
                 resources_str=resources_str,
                 specs={
-                    'max_restarts_on_errors':
-                        self._strategy_executor.max_restarts_on_errors,
-                    'recover_on_exit_codes':
-                        self._strategy_executor.recover_on_exit_codes
+                    'max_restarts_on_errors': executor.max_restarts_on_errors,
+                    'recover_on_exit_codes': executor.recover_on_exit_codes
                 },
                 callback_func=callback_func,
                 full_resources_json=full_resources_json)
@@ -474,7 +505,7 @@ class JobController:
             # Run the launch in a separate thread to avoid blocking the event
             # loop. The scheduler functions used internally already have their
             # own file locks.
-            remote_job_submitted_at = await self._strategy_executor.launch()
+            remote_job_submitted_at = await executor.launch()
 
             launch_time = time.time() - launch_start
             logger.info(f'Cluster launch completed in {launch_time:.2f}s')
@@ -555,7 +586,7 @@ class JobController:
             task_id=task_id,
             task=task,
             cluster_name=cluster_name,
-            executor=self._strategy_executor,
+            executor=executor,
             job_id_on_pool_cluster=job_id_on_pool_cluster,
             callback_func=callback_func,
             cleanup_cluster_on_success=True,
@@ -1560,6 +1591,122 @@ class JobController:
                 except Exception as e:  # pylint: disable=broad-except
                     logger.warning(f'Failed to cleanup {cluster_name}: {e}')
 
+    async def _mark_task_cancelled(self, task_id: int, task: 'sky.Task',
+                                   reason: str) -> None:
+        """Record a single task as CANCELLED with a failure reason.
+
+        Used by DAG-mode execution to skip a task whose predecessor failed.
+        """
+        callback_func = managed_job_utils.event_callback_func(
+            job_id=self._job_id, task_id=task_id, task=task)
+        await managed_job_state.set_task_cancelled_async(
+            job_id=self._job_id,
+            task_id=task_id,
+            failure_reason=reason,
+            callback_func=callback_func)
+
+    async def _run_dag(self) -> bool:
+        """Run a DAG with dependency-gated concurrent execution.
+
+        Each task runs as its own asyncio.Task and only starts once every
+        predecessor (per ``dag.add_edge``) has succeeded. If any predecessor
+        is not SUCCEEDED, the task is marked CANCELLED with a reason naming
+        the upstream failure, and the cancellation propagates to its
+        descendants.
+
+        Returns:
+            True iff every task ended in SUCCEEDED.
+        """
+        tasks = self._dag.tasks
+        logger.info(f'Starting DAG execution with {len(tasks)} tasks: '
+                    f'{[t.name for t in tasks]}')
+
+        if not tasks:
+            return True
+
+        # task_id is the position in dag.tasks (existing convention shared
+        # with serial / job-group modes). Predecessors come from the
+        # in-memory networkx graph; we don't persist edges.
+        task_id_of = {t: i for i, t in enumerate(tasks)}
+        preds: Dict[int, List[int]] = {
+            i: [task_id_of[p] for p in self._dag.graph.predecessors(t)
+               ] for i, t in enumerate(tasks)
+        }
+
+        done_events: Dict[int, asyncio.Event] = {
+            i: asyncio.Event() for i in range(len(tasks))
+        }
+        outcomes: Dict[int, bool] = {}
+
+        # Resume after controller restart: pre-populate outcomes from any
+        # tasks already in a terminal state in the spot table.
+        for tid in range(len(tasks)):
+            status = await managed_job_state.get_job_status_with_task_id_async(
+                job_id=self._job_id, task_id=tid)
+            if status == managed_job_state.ManagedJobStatus.CANCELLING:
+                logger.info('DAG job was being cancelled, '
+                            're-raising cancellation')
+                raise asyncio.CancelledError()
+            if status is not None and status.is_terminal():
+                succeeded = (
+                    status == managed_job_state.ManagedJobStatus.SUCCEEDED)
+                outcomes[tid] = succeeded
+                done_events[tid].set()
+                logger.info(f'Task {tid} ({tasks[tid].name}) already '
+                            f'terminal ({status}); outcome={succeeded}')
+
+        if all(tid in outcomes for tid in range(len(tasks))):
+            logger.info('All DAG tasks already terminal; nothing to do.')
+            return all(outcomes.values())
+
+        async def _run_one(tid: int) -> None:
+            task = tasks[tid]
+            # Wait for all predecessors to finish (whether success or not).
+            if preds[tid]:
+                await asyncio.gather(
+                    *(done_events[p].wait() for p in preds[tid]))
+            # If any predecessor did not succeed, propagate as CANCELLED.
+            failed_preds = [p for p in preds[tid] if not outcomes.get(p, False)]
+            if failed_preds:
+                names = [tasks[p].name for p in failed_preds]
+                reason = (f'Upstream task(s) did not succeed: {names}')
+                logger.info(f'Skipping task {tid} ({task.name}): {reason}')
+                try:
+                    await self._mark_task_cancelled(tid, task, reason)
+                finally:
+                    outcomes[tid] = False
+                    done_events[tid].set()
+                return
+            # If we already loaded a terminal outcome for this task on
+            # resume, nothing more to do.
+            if tid in outcomes:
+                done_events[tid].set()
+                return
+            ok = False
+            try:
+                ok = await self._run_one_task(tid, task, dag_mode=True)
+            finally:
+                # Always set the event so descendants don't deadlock,
+                # even if _run_one_task raised.
+                outcomes[tid] = ok
+                done_events[tid].set()
+
+        coros = [
+            _run_one(tid) for tid in range(len(tasks)) if tid not in outcomes
+        ]
+        # return_exceptions=True keeps sibling tasks running even if one
+        # crashes (each coro sets its done_event in its `finally` block,
+        # so descendants won't deadlock).
+        results = await asyncio.gather(*coros, return_exceptions=True)
+        for r in results:
+            if isinstance(r, BaseException) and not isinstance(
+                    r, asyncio.CancelledError):
+                # Surface the first non-cancellation exception so the outer
+                # `run()` handler records it as FAILED_CONTROLLER.
+                raise r
+
+        return all(outcomes.values())
+
     async def run(self):
         """Run controller logic and handle exceptions."""
         logger.info(f'Starting JobsController run for job {self._job_id}')
@@ -1574,6 +1721,10 @@ class JobController:
                 logger.info(f'Running as JobGroup with {len(self._dag.tasks)} '
                             f'parallel jobs')
                 succeeded = await self._run_job_group()
+            elif self._dag.is_dag_execution():
+                logger.info(f'Running as DAG with {len(self._dag.tasks)} '
+                            f'tasks, dependency-gated concurrent execution')
+                succeeded = await self._run_dag()
             else:
                 # Traditional chain DAG: serial execution
                 for task_id, task in enumerate(self._dag.tasks):
